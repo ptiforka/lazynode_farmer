@@ -19,7 +19,7 @@ WEBSOCKET_URLS = [
     "wss://proxy2.wynd.network:4444",
 ]
 
-PING_INTERVAL = 120
+PING_INTERVAL = 60
 RECONNECT_DELAY = 5
 FETCH_TIMEOUT = 10
 
@@ -99,9 +99,9 @@ async def authenticate(_data, user_id):
         "user_id": user_id,
         "user_agent": BROWSER_HEADERS["User-Agent"],
         "timestamp": int(time.time()),
-        "device_type": "extension",
-        "version": "4.26.2",
-        "extension_id": "ilehaonighjijnmpnagapkhpcdbhclfg"
+        "device_type": "desktop",
+        "version": "4.29.0",
+        #"extension_id": "ilehaonighjijnmpnagapkhpcdbhclfg"
     }
 
 async def handle_pong(_data):
