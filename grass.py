@@ -22,6 +22,7 @@ WEBSOCKET_URLS = [
 PING_INTERVAL = 60
 RECONNECT_DELAY = 5
 FETCH_TIMEOUT = 10
+RESTART_INTERVAL = 3600  # 1 hour in seconds
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
@@ -101,7 +102,6 @@ async def authenticate(_data, user_id):
         "timestamp": int(time.time()),
         "device_type": "desktop",
         "version": "4.29.0",
-        #"extension_id": "ilehaonighjijnmpnagapkhpcdbhclfg"
     }
 
 async def handle_pong(_data):
@@ -131,7 +131,6 @@ async def handle_incoming_message(ws, raw_message, connection_id, proxy, user_id
     msg_id = message.get("id")
     logger.info(f"[WebSocket-{connection_id}] Handling action: {action}, msg_id={msg_id}")
 
-    # Define RPC_CALL_TABLE here so we can pass user_id to AUTH
     RPC_CALL_TABLE = {
         "HTTP_REQUEST": perform_http_request,
         "AUTH": lambda data: authenticate(data, user_id),
@@ -236,10 +235,7 @@ async def run_connection(proxy, connection_id, user_id):
         logger.info(f"[WebSocket-{connection_id}] Reconnecting in {RECONNECT_DELAY} seconds...")
         await asyncio.sleep(RECONNECT_DELAY)
 
-async def main():
-    # Ask the user for user_id at the start
-    user_id = input("Please enter user_id: ").strip()
-
+async def start_all_connections(user_id):
     logger.info("[Main] Loading proxies from local_proxies.txt...")
     with open("local_proxies.txt", "r") as f:
         proxies = [line.strip() for line in f if line.strip()]
@@ -248,7 +244,30 @@ async def main():
     tasks = []
     for i, proxy in enumerate(proxies):
         tasks.append(asyncio.create_task(run_connection(proxy, i, user_id)))
-    await asyncio.gather(*tasks)
+    return tasks
+
+async def main():
+    user_id = input("Please enter user_id: ").strip()
+
+    # Loop indefinitely: start all connections, run for an hour, then restart
+    while True:
+        tasks = await start_all_connections(user_id)
+
+        logger.info("[Main] Running connections for one hour...")
+        # Run for RESTART_INTERVAL seconds (1 hour)
+        try:
+            await asyncio.sleep(RESTART_INTERVAL)
+        except asyncio.CancelledError:
+            # If main is cancelled, break out
+            break
+
+        # One hour passed, cancel all tasks
+        logger.info("[Main] One hour passed. Stopping all tasks and restarting.")
+        for t in tasks:
+            t.cancel()
+
+        # Give tasks a moment to shut down gracefully
+        await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
