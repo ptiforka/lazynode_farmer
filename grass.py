@@ -99,8 +99,9 @@ class ConnectionHandler:
             "user_id": self.user_id,
             "user_agent": BROWSER_HEADERS["User-Agent"],
             "timestamp": int(time.time()),
-            "device_type": "desktop",
-            "version": "4.30.0",
+            "device_type": "extension",
+            "version": "4.26.2",
+            "extension_id": "lkbnfiajjmbhnfledhphioinpickokdi"
         }
 
     async def handle_pong(self, _data):
