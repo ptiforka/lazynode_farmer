@@ -100,7 +100,7 @@ class ConnectionHandler:
             "user_agent": BROWSER_HEADERS["User-Agent"],
             "timestamp": int(time.time()),
             "device_type": "desktop",
-            "version": "4.29.0",
+            "version": "4.30.0",
         }
 
     async def handle_pong(self, _data):
