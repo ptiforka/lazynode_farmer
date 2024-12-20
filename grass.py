@@ -17,7 +17,7 @@ WEBSOCKET_URLS = [
 
 PING_INTERVAL = 60
 FETCH_TIMEOUT = 10
-RECONNECT_DELAY = 15
+RECONNECT_DELAY = 1900
 HEARTBEAT_TIMEOUT = 130  # If no messages received within this time, reconnect
 
 # 402 handling configuration
