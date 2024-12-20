@@ -17,8 +17,12 @@ WEBSOCKET_URLS = [
 
 PING_INTERVAL = 60
 FETCH_TIMEOUT = 10
-RECONNECT_DELAY = 5
+RECONNECT_DELAY = 15
 HEARTBEAT_TIMEOUT = 130  # If no messages received within this time, reconnect
+
+# 402 handling configuration
+MAX_402_ERRORS = 301
+HOUR_DELAY = 3600  # 1 hour
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -30,6 +34,10 @@ BROWSER_HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1"
 }
+
+# Global variable to track 402 errors across all requests
+global_402_count = 0
+stop_all_connections_event = asyncio.Event()
 
 class ConnectionHandler:
     def __init__(self, proxy, connection_id, user_id):
@@ -43,6 +51,7 @@ class ConnectionHandler:
         self.ping_task = None
 
     async def perform_http_request(self, data):
+        global global_402_count
         request_id = str(uuid.uuid4())
         method = data.get("method", "GET").upper()
         url = data.get("url")
@@ -74,6 +83,19 @@ class ConnectionHandler:
                     b64_body = base64.b64encode(content).decode("utf-8")
 
                     logger.info(f"[{self.connection_id}-HTTP_REQUEST-{request_id}] Response: {status} {reason}")
+
+                    # Handle 402 errors
+                    if status == 402:
+                        global_402_count += 1
+                        logger.error(f"[{self.connection_id}-HTTP_REQUEST-{request_id}] Encountered 402 error. Count: {global_402_count}")
+                        if global_402_count > MAX_402_ERRORS:
+                            logger.error("Too many 402 errors encountered. Disabling connections and retrying in one hour...")
+                            await stop_all_connections()
+                            await asyncio.sleep(HOUR_DELAY)
+                            # After sleeping, reset the count and resume
+                            global_402_count = 0
+                            await start_all_connections(self.user_id)  # Attempt to restart all connections
+
                     return {
                         "url": str(response.url),
                         "status": status,
@@ -169,13 +191,13 @@ class ConnectionHandler:
             await self.ws.send(json.dumps(message))
 
     async def ping_loop(self):
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not stop_all_connections_event.is_set():
             if self.ws and self.ws.open:
                 await self.send_ping()
             await asyncio.sleep(PING_INTERVAL)
 
     async def heartbeat_check(self):
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not stop_all_connections_event.is_set():
             await asyncio.sleep(HEARTBEAT_TIMEOUT)
             if (time.time() - self.last_live_ts) > HEARTBEAT_TIMEOUT:
                 logger.warning(f"[{self.connection_id}] No recent activity, reconnecting...")
@@ -193,7 +215,7 @@ class ConnectionHandler:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not stop_all_connections_event.is_set():
             uri = random.choice(WEBSOCKET_URLS)
             logger.info(f"[{self.connection_id}] Connecting to {uri} via {self.proxy}")
 
@@ -209,6 +231,9 @@ class ConnectionHandler:
 
                     try:
                         async for msg in websocket:
+                            # If global stop event is set, break out of loop
+                            if stop_all_connections_event.is_set():
+                                break
                             await self.handle_incoming_message(msg)
                     except Exception as e:
                         logger.error(f"[{self.connection_id}] WebSocket error: {e}")
@@ -219,14 +244,22 @@ class ConnectionHandler:
             except Exception as e:
                 logger.error(f"[{self.connection_id}] Connection error: {e}")
 
-            logger.info(f"[{self.connection_id}] Reconnecting in {RECONNECT_DELAY} seconds...")
-            await asyncio.sleep(RECONNECT_DELAY)
+            if not stop_all_connections_event.is_set():
+                logger.info(f"[{self.connection_id}] Reconnecting in {RECONNECT_DELAY} seconds...")
+                await asyncio.sleep(RECONNECT_DELAY)
 
     async def stop(self):
         self.stop_event.set()
         await self.close_ws()
 
+
+async def stop_all_connections():
+    stop_all_connections_event.set()
+    logger.info("[Main] Stopping all connections due to excessive 402 errors.")
+
+
 async def start_all_connections(user_id):
+    stop_all_connections_event.clear()
     logger.info("[Main] Loading proxies from local_proxies.txt...")
     with open("local_proxies.txt", "r") as f:
         proxies = [line.strip() for line in f if line.strip()]
