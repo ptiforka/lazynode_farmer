@@ -21,7 +21,7 @@ RECONNECT_DELAY = 15
 HEARTBEAT_TIMEOUT = 130  # If no messages received within this time, reconnect
 
 # 402 handling configuration
-MAX_402_ERRORS = 301
+MAX_402_ERRORS = 50
 HOUR_DELAY = 3600  # 1 hour
 
 BROWSER_HEADERS = {
@@ -35,9 +35,9 @@ BROWSER_HEADERS = {
     "Upgrade-Insecure-Requests": "1"
 }
 
-# Global variable to track 402 errors across all requests
 global_402_count = 0
 stop_all_connections_event = asyncio.Event()
+
 
 class ConnectionHandler:
     def __init__(self, proxy, connection_id, user_id):
@@ -47,11 +47,8 @@ class ConnectionHandler:
         self.last_live_ts = time.time()
         self.stop_event = asyncio.Event()
         self.ws = None
-        self.reconnect_task = None
-        self.ping_task = None
 
     async def perform_http_request(self, data):
-        global global_402_count
         request_id = str(uuid.uuid4())
         method = data.get("method", "GET").upper()
         url = data.get("url")
@@ -63,8 +60,9 @@ class ConnectionHandler:
         request_body = base64.b64decode(body_b64) if body_b64 else None
 
         logger.info(f"[{self.connection_id}-HTTP_REQUEST-{request_id}] {method} {url} via {self.proxy}")
-
         connector = aiohttp.TCPConnector(ssl=False)
+
+        # Just perform the request, no special 402 handling here
         async with aiohttp.ClientSession(connector=connector) as session:
             try:
                 async with session.request(
@@ -81,20 +79,7 @@ class ConnectionHandler:
                     raw_headers = response.headers
                     content = await response.read()
                     b64_body = base64.b64encode(content).decode("utf-8")
-
                     logger.info(f"[{self.connection_id}-HTTP_REQUEST-{request_id}] Response: {status} {reason}")
-
-                    # Handle 402 errors
-                    if status == 402:
-                        global_402_count += 1
-                        logger.error(f"[{self.connection_id}-HTTP_REQUEST-{request_id}] Encountered 402 error. Count: {global_402_count}")
-                        if global_402_count > MAX_402_ERRORS:
-                            logger.error("Too many 402 errors encountered. Disabling connections and retrying in one hour...")
-                            await stop_all_connections()
-                            await asyncio.sleep(HOUR_DELAY)
-                            # After sleeping, reset the count and resume
-                            global_402_count = 0
-                            await start_all_connections(self.user_id)  # Attempt to restart all connections
 
                     return {
                         "url": str(response.url),
@@ -210,6 +195,7 @@ class ConnectionHandler:
         self.ws = None
 
     async def run(self):
+        global global_402_count
         proxy_obj = Proxy.from_url(self.proxy)
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
@@ -231,7 +217,6 @@ class ConnectionHandler:
 
                     try:
                         async for msg in websocket:
-                            # If global stop event is set, break out of loop
                             if stop_all_connections_event.is_set():
                                 break
                             await self.handle_incoming_message(msg)
@@ -243,6 +228,22 @@ class ConnectionHandler:
 
             except Exception as e:
                 logger.error(f"[{self.connection_id}] Connection error: {e}")
+
+                # Check if this error is related to a 402 response
+                # The exact condition depends on how the 402 manifests.
+                # You might need to adjust this detection logic.
+                error_str = str(e)
+                if "402" in error_str:
+                    global_402_count += 1
+                    logger.error(f"[{self.connection_id}] Encountered 402 error. Count: {global_402_count}")
+                    if global_402_count > MAX_402_ERRORS:
+                        logger.error("Too many 402 errors encountered. Disabling connections and retrying in one hour...")
+                        await stop_all_connections()
+                        await asyncio.sleep(HOUR_DELAY)
+                        # After sleeping, reset the count and resume
+                        global_402_count = 0
+                        await start_all_connections(self.user_id)
+                        return  # Stop this connection handler since we restarted all connections
 
             if not stop_all_connections_event.is_set():
                 logger.info(f"[{self.connection_id}] Reconnecting in {RECONNECT_DELAY} seconds...")
