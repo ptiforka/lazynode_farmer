@@ -17,7 +17,7 @@ WEBSOCKET_URLS = [
 
 PING_INTERVAL = 60
 FETCH_TIMEOUT = 10
-RECONNECT_DELAY = 60
+RECONNECT_DELAY = 300
 HEARTBEAT_TIMEOUT = 130  # If no messages received within this time, reconnect
 
 # 402 handling configuration
@@ -203,6 +203,7 @@ class ConnectionHandler:
 
         while not self.stop_event.is_set() and not stop_all_connections_event.is_set():
             uri = random.choice(WEBSOCKET_URLS)
+            time.sleep(0.7)
             logger.info(f"[{self.connection_id}] Connecting to {uri} via {self.proxy}")
 
             try:
