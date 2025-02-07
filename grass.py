@@ -203,7 +203,6 @@ class ConnectionHandler:
 
         while not self.stop_event.is_set() and not stop_all_connections_event.is_set():
             uri = random.choice(WEBSOCKET_URLS)
-            time.sleep(0.7)
             logger.info(f"[{self.connection_id}] Connecting to {uri} via {self.proxy}")
 
             try:
