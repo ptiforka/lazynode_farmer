@@ -12,7 +12,7 @@ from loguru import logger
 EXTENSION_ID = "lkbnfiajjmbhnfledhphioinpickokdi"
 EXTENSION_VERSION = "5.1.1"
 DIRECTOR_SERVER = "https://director.getgrass.io"
-PING_INTERVAL = 60
+PING_INTERVAL = 120
 RECONNECT_DELAY = 20  # seconds
 
 
