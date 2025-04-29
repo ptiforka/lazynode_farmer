@@ -7,7 +7,7 @@ import random
 from typing import Optional
 
 import aiohttp
-from aiohttp import WSMsgType, ClientWSTimeout
+from aiohttp import WSMsgType, ClientTimeout
 from fake_useragent import UserAgent
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_random, retry_if_exception_type
@@ -100,7 +100,7 @@ class GrassWs:
             uri,
             headers=headers,
             proxy=self.proxy,
-            timeout=ClientWSTimeout(ws_close=30)
+            timeout=ClientTimeout(ws_close=30)
         )
         logger.success(f"[{self.proxy}] WebSocket connected.")
 
