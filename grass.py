@@ -4,238 +4,239 @@ import os
 import uuid
 import base64
 import random
+import re
 from typing import Optional
 
 import aiohttp
-from aiohttp import WSMsgType, ClientTimeout
+from aiohttp import WSMsgType
 from fake_useragent import UserAgent
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_random, retry_if_exception_type
 
-# === Configuration Constants ===
-EXTENSION_ID = "lkbnfiajjmbhnfledhphioinpickokdi"
-EXTENSION_VERSION = "5.1.1"
+# === Config ===
+EXTENSION_ID    = "lkbnfiajjmbhnfledhphioinpickokdi"
+EXTENSION_VER   = "5.1.1"
 DIRECTOR_SERVER = "https://director.getgrass.io"
-PING_INTERVAL = 120  # seconds
-RECONNECT_DELAY = 100  # seconds
+PING_INTERVAL   = 120         # seconds
+BASE_BACKOFF    = 100          # seconds
+JITTER_FACTOR   = 0.8         # fraction of BASE_BACKOFF
 
-# === Helper Functions ===
+
+def jitter_delay(base: float) -> float:
+    return base + random.uniform(0, base * JITTER_FACTOR)
+
+
 def array_buffer_to_base64(data: bytes) -> str:
-    """Encode bytes into a base64 string."""
     return base64.b64encode(data).decode("utf-8")
 
 
-# === GrassWs Class ===
-class GrassWs:
+class GrassClient:
     def __init__(self, user_id: str, proxy: Optional[str] = None):
-        self.user_id = user_id
-        self.proxy = proxy
+        self.user_id    = user_id
+        self.proxy      = proxy
         self.browser_id = str(uuid.uuid4())
-        self.user_agent = str(UserAgent().random)
-        self.session = None
-        self.websocket: Optional[aiohttp.ClientWebSocketResponse] = None
-        self.destination: Optional[str] = None
+        self.user_agent = UserAgent().random
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.dest: Optional[str] = None
         self.token: Optional[str] = None
-        self.alive = True
 
-    async def create_session(self):
-        if self.session is None or self.session.closed:
+    async def ensure_session(self):
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
 
-    async def get_checkin(self):
-        await self.create_session()
+    async def checkin(self):
+        await self.ensure_session()
         payload = {
-            "browserId": self.browser_id,
-            "userId": self.user_id,
-            "version": EXTENSION_VERSION,
+            "browserId":   self.browser_id,
+            "userId":      self.user_id,
+            "version":     EXTENSION_VER,
             "extensionId": EXTENSION_ID,
-            "userAgent": self.user_agent,
-            "deviceType": "extension",
+            "userAgent":   self.user_agent,
+            "deviceType":  "extension",
         }
         headers = {
-            "Connection": "keep-alive",
-            "User-Agent": self.user_agent,
+            "User-Agent":   self.user_agent,
             "Content-Type": "application/json",
-            "Accept": "*/*",
-            "Origin": f"chrome-extension://{EXTENSION_ID}",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Origin":       f"chrome-extension://{EXTENSION_ID}",
         }
-        logger.info(f"[{self.proxy}] Doing checkin...")
+
+        logger.info(f"[{self.proxy}] CHECKIN → POST {DIRECTOR_SERVER}/checkin")
         async with self.session.post(
             f"{DIRECTOR_SERVER}/checkin",
             json=payload,
             headers=headers,
             proxy=self.proxy,
         ) as resp:
-            text = await resp.text()
-            if resp.status != 201:
-                raise Exception(f"Checkin failed: {resp.status}")
-            data = json.loads(text)
-            self.destination = data["destinations"][0]
+            text   = await resp.text()
+            status = resp.status
+
+            if status in (429, 503):
+                retry_after = resp.headers.get("Retry-After", "").strip()
+                try:
+                    delay = float(retry_after)
+                except ValueError:
+                    delay = 60.0
+                raise RuntimeError(f"CHECKIN {status} ({text.strip()}), retry after {delay}")
+
+            if status != 201:
+                raise RuntimeError(f"CHECKIN failed {status}: {text!r}")
+
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                raise RuntimeError(f"CHECKIN: invalid JSON: {text!r}")
+
+            self.dest  = data["destinations"][0]
             self.token = data["token"]
-            logger.success(f"[{self.proxy}] Checkin success. Token refreshed.")
+            logger.success(f"[{self.proxy}] CHECKIN OK → dest={self.dest}")
 
-    async def connect_websocket(self):
-        await self.create_session()
-        if not (self.destination and self.token):
-            raise Exception("Missing destination or token.")
-
-        uri = f"wss://{self.destination}/?token={self.token}"
+    async def connect_ws(self):
+        if not self.dest or not self.token:
+            raise RuntimeError("missing dest/token")
+        uri = f"wss://{self.dest}/?token={self.token}"
         headers = {
-            "Host": self.destination,
-            "Connection": "Upgrade",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
             "User-Agent": self.user_agent,
-            "Upgrade": "websocket",
-            "Origin": f"chrome-extension://{EXTENSION_ID}",
-            "Sec-WebSocket-Version": "13",
-            "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(),
-            "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
-            "Accept": "*/*",
+            "Origin":     f"chrome-extension://{EXTENSION_ID}",
         }
-        logger.info(f"[{self.proxy}] Connecting WebSocket...")
-        self.websocket = await self.session.ws_connect(
-            uri,
-            headers=headers,
-            proxy=self.proxy,
-            timeout=ClientTimeout(ws_close=30)
-        )
-        logger.success(f"[{self.proxy}] WebSocket connected.")
+        logger.info(f"[{self.proxy}] WS → CONNECT {uri}")
+        self.ws = await self.session.ws_connect(uri, headers=headers, proxy=self.proxy)
+        logger.success(f"[{self.proxy}] WS ← OPEN")
 
-    async def send_message(self, message: dict):
-        await self.websocket.send_str(json.dumps(message, separators=(",", ":")))
+    async def send_json(self, msg: dict):
+        await self.ws.send_str(json.dumps(msg, separators=(",", ":")))
 
     async def send_ping(self):
-        ping_msg = {
-            "id": str(uuid.uuid4()),
+        ping = {
+            "id":      str(uuid.uuid4()),
             "version": "1.0.0",
-            "action": "PING",
-            "data": {},
+            "action":  "PING",
+            "data":    {},
         }
-        logger.debug(f"[{self.proxy}] Sending PING...")
-        await self.send_message(ping_msg)
+        await self.send_json(ping)
+        logger.debug(f"[{self.proxy}] WS → PING")
 
-    async def perform_http_request(self, params: dict) -> dict:
-        url = params.get("url")
-        method = params.get("method", "GET")
-        headers = params.get("headers", {})
-        body = params.get("body")
-
-        request_kwargs = {
-            "method": method,
-            "url": url,
-            "headers": headers,
-            "ssl": False,
+    async def http_request(self, params: dict) -> dict:
+        kwargs = {
+            "method":  params.get("method", "GET"),
+            "url":     params["url"],
+            "headers": params.get("headers", {}),
+            "ssl":     False,
+            "proxy":   self.proxy,
         }
-        if body:
-            request_kwargs["data"] = base64.b64decode(body)
-
-        async with self.session.request(**request_kwargs, proxy=self.proxy) as resp:
+        if body := params.get("body"):
+            kwargs["data"] = base64.b64decode(body)
+        async with self.session.request(**kwargs) as resp:
             content = await resp.read()
-            resp_headers = {k: v for k, v in resp.headers.items() if k.lower() != "content-encoding"}
+            hdrs = {k: v for k, v in resp.headers.items() if k.lower() != "content-encoding"}
             return {
-                "url": str(resp.url),
-                "status": resp.status,
+                "url":         str(resp.url),
+                "status":      resp.status,
                 "status_text": resp.reason,
-                "headers": resp_headers,
-                "body": array_buffer_to_base64(content),
+                "headers":     hdrs,
+                "body":        array_buffer_to_base64(content),
             }
 
-    async def handle_messages(self):
-        async for msg in self.websocket:
+    async def handle_ws(self):
+        async for msg in self.ws:
             if msg.type == WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    action = data.get("action")
-                    req_id = data.get("id")
+                data   = json.loads(msg.data)
+                action = data.get("action")
+                req_id = data.get("id")
 
-                    if action == "PING":
-                        await self.send_message({"id": req_id, "origin_action": "PONG", "result": {}})
-                    elif action == "PONG":
-                        pass
-                    elif action == "HTTP_REQUEST":
-                        params = data.get("data")
-                        result = await self.perform_http_request(params)
-                        await self.send_message({"id": req_id, "origin_action": "HTTP_REQUEST", "result": result})
-                    elif action == "AUTH":
-                        auth_payload = {
-                            "browser_id": self.browser_id,
-                            "user_id": self.user_id,
-                            "user_agent": self.user_agent,
-                            "timestamp": int(asyncio.get_event_loop().time()),
-                            "device_type": "extension",
-                            "version": EXTENSION_VERSION,
-                            "extension_id": EXTENSION_ID,
-                        }
-                        await self.send_message({"id": req_id, "origin_action": "AUTH", "result": auth_payload})
-                    else:
-                        logger.warning(f"[{self.proxy}] Unknown action: {action}")
+                if action == "PING":
+                    # reply server PING with PONG
+                    await self.send_json({
+                        "id":             req_id,
+                        "origin_action":  "PONG",
+                        "result":         {}
+                    })
+                elif action == "PONG":
+                    # server heartbeat acknowledgement, ignore
+                    continue
+                elif action == "HTTP_REQUEST":
+                    result = await self.http_request(data["data"])
+                    await self.send_json({
+                        "id":             req_id,
+                        "origin_action":  "HTTP_REQUEST",
+                        "result":         result
+                    })
+                elif action == "AUTH":
+                    auth = {
+                        "browser_id":   self.browser_id,
+                        "user_id":      self.user_id,
+                        "user_agent":   self.user_agent,
+                        "timestamp":    int(asyncio.get_event_loop().time()),
+                        "device_type":  "extension",
+                        "version":      EXTENSION_VER,
+                        "extension_id": EXTENSION_ID,
+                    }
+                    await self.send_json({
+                        "id":             req_id,
+                        "origin_action":  "AUTH",
+                        "result":         auth
+                    })
+                else:
+                    logger.warning(f"[{self.proxy}] WS ← Unknown action {action!r}")
 
-                except Exception as e:
-                    logger.error(f"[{self.proxy}] Message handling error: {e}")
-
-            elif msg.type == WSMsgType.CLOSED:
-                logger.warning(f"[{self.proxy}] WebSocket closed.")
-                break
-            elif msg.type == WSMsgType.ERROR:
-                logger.error(f"[{self.proxy}] WebSocket error.")
+            elif msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
+                logger.warning(f"[{self.proxy}] WS ← {msg.type.name}, exiting")
                 break
 
     async def ping_loop(self):
-        while self.alive:
-            await asyncio.sleep(PING_INTERVAL)
+        while self.ws and not self.ws.closed:
+            await asyncio.sleep(PING_INTERVAL + random.uniform(-5, 5))
             try:
                 await self.send_ping()
-            except Exception as e:
-                logger.error(f"[{self.proxy}] Ping failed: {e}")
+            except Exception:
                 break
 
-    @retry(stop=stop_after_attempt(3), wait=wait_random(3, 5))
-    async def connection_handler(self):
-        await self.get_checkin()
-        await self.connect_websocket()
-
     async def run(self):
-        while self.alive:
-            try:
-                await self.connection_handler()
-                await asyncio.gather(self.handle_messages(), self.ping_loop())
-            except Exception as e:
-                logger.error(f"[{self.proxy}] Exception occurred: {e}")
-                await asyncio.sleep(RECONNECT_DELAY)
-            finally:
+        await self.ensure_session()
+        backoff = BASE_BACKOFF
+        while True:
+            # only checkin/connect if WS is not open
+            if not self.ws or self.ws.closed:
                 try:
-                    if self.websocket:
-                        await self.websocket.close()
-                    if self.session:
-                        await self.session.close()
+                    await self.checkin()
+                    await self.connect_ws()
+                except RuntimeError as e:
+                    m = re.search(r"retry after ([\d\.]+)", str(e))
+                    backoff = float(m.group(1)) if m else BASE_BACKOFF
+                    logger.error(f"[{self.proxy}] {e}; retrying in {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+                    continue
                 except Exception as e:
-                    logger.error(f"[{self.proxy}] Cleanup error: {e}")
+                    logger.error(f"[{self.proxy}] UNEXPECTED: {e}; retrying in {backoff:.1f}s")
+                    await asyncio.sleep(backoff)
+                    continue
 
-# === Load Proxies ===
-def load_proxies(file_path: str = "local_proxies.txt") -> list:
+            # steady-state: WS is open, run handlers
+            try:
+                await asyncio.gather(self.handle_ws(), self.ping_loop())
+            except Exception as e:
+                logger.warning(f"[{self.proxy}] WS died: {e}; reconnecting in {BASE_BACKOFF}s")
+            finally:
+                if self.ws:
+                    await self.ws.close()
+                    self.ws = None
+                await asyncio.sleep(BASE_BACKOFF)
+
+
+def load_proxies(path="local_proxies.txt") -> list[str]:
     try:
-        with open(file_path, "r") as f:
-            return [line.strip() for line in f if line.strip()]
+        return [line.strip() for line in open(path) if line.strip()]
     except FileNotFoundError:
-        logger.warning("local_proxies.txt not found.")
+        logger.warning("no proxy file, using direct connection")
         return []
 
-# === Start Clients ===
-async def start_all_connections(user_id: str):
-    proxies = load_proxies()
-    clients = [GrassWs(user_id=user_id, proxy=p) for p in proxies] if proxies else [GrassWs(user_id=user_id)]
-
-    await asyncio.gather(*(client.run() for client in clients))
-
 async def main():
-    user_id = input("Enter your user_id: ").strip()
-    await start_all_connections(user_id)
+    user_id = input("Enter user_id: ").strip()
+    proxies = load_proxies()
+    clients = [GrassClient(user_id, p) for p in proxies] or [GrassClient(user_id)]
+    await asyncio.gather(*(c.run() for c in clients))
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Program interrupted. Exiting...")
+        logger.info("Exiting…")
