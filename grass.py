@@ -184,7 +184,7 @@ class GrassClient:
 
     async def ping_loop(self):
         while self.ws and not self.ws.closed:
-            await asyncio.sleep(PING_INTERVAL + random.uniform(-5, 5))
+            await asyncio.sleep(PING_INTERVAL)
             try:
                 await self.send_ping()
             except Exception:
