@@ -324,19 +324,8 @@ async def start_all_connections(user_id: str):
 
 
 async def main():
-    try:
-        with open("user_ids.txt", "r") as f:
-            user_ids = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-    except FileNotFoundError:
-        logger.error("user_ids.txt file not found.")
-        return
-
-    if not user_ids:
-        logger.warning("No valid user IDs found in user_ids.txt.")
-        return
-
-    # Create and run all connections for all user IDs concurrently
-    await asyncio.gather(*(start_all_connections(user_id) for user_id in user_ids))
+    user_id = input("Enter your user_id: ").strip()
+    await start_all_connections(user_id)
 
 
 if __name__ == "__main__":
